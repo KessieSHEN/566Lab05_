@@ -1,0 +1,202 @@
+---
+title: "Lab05_SiShen"
+format: html
+editor: visual
+---
+
+## SetUp in R
+
+```{r}
+
+library(dtplyr)
+library(dplyr)
+library(R.utils)
+library(leaflet)
+library(data.table)
+
+```
+
+## Pre-process the stations data
+
+```{r}
+if (!file.exists("met_all.gz"))
+  download.file(
+    url = "https://raw.githubusercontent.com/USCbiostats/data-science-data/master/02_met/met_all.gz",
+    destfile = "met_all.gz",
+    method   = "libcurl",
+    timeout  = 60
+    )
+met <- data.table::fread("met_all.gz")
+stations <- fread("https://noaa-isd-pds.s3.amazonaws.com/isd-history.csv")
+stations[, USAF := as.integer(USAF)]
+stations[, USAF   := fifelse(USAF == 999999, NA_integer_, USAF)]
+stations[, CTRY   := fifelse(CTRY == "", NA_character_, CTRY)]
+stations[, STATE  := fifelse(STATE == "", NA_character_, STATE)]
+stations <- unique(stations[, list(USAF, CTRY, STATE)])
+stations <- stations[!is.na(USAF)]
+stations[, n := 1:.N, by = .(USAF)]
+stations <- stations[n == 1,][, n := NULL]
+#Merge the data
+met <- met[, .(USAFID, WBAN, year, month, day, hour, min, lat, lon, elev, wind.sp, temp, atm.press)]
+metmerge <- merge(
+  # Data
+  x     = met,      
+  y     = stations, 
+  # List of variables to match
+  by.x  = "USAFID",
+  by.y  = "USAF", 
+  # Which obs to keep?
+  all.x = TRUE,      
+  all.y = FALSE
+  )
+head(metmerge[, list(USAFID, WBAN, STATE)], n = 4)
+dim(metmerge)
+metmerge
+```
+
+## Question 1: Representative station for the US
+
+```{r}
+metbys <- aggregate(
+  cbind(temp, wind.sp, atm.press, lat, lon, elev) ~ USAFID,
+  data = metmerge,
+  FUN = median, na.rm = TRUE
+)
+#Look for the three weather stations that best represent continental US using the quantile() function.
+quantiles_temp <- quantile(metbys$temp, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+quantiles_wind <- quantile(metbys$wind.sp, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+quantiles_pressure <- quantile(metbys$atm.press, probs = c(0.25, 0.5, 0.75), na.rm = TRUE)
+#Find stations for the median (50th percentile)
+median_station_temp <- metbys[which.min(abs(metbys$temp - quantiles_temp[2])), ]
+median_station_wind <- metbys[which.min(abs(metbys$wind.sp - quantiles_wind[2])), ]
+median_station_pressure <- metbys[which.min(abs(metbys$atm.press - quantiles_pressure[2])), ]
+
+print(median_station_temp)
+print(median_station_wind)
+print(median_station_pressure)
+
+```
+
+## Question 2: Representative station per state
+
+```{r}
+state_medians <- metmerge %>%
+  group_by(STATE) %>%
+  summarise(
+    median_temp = median(temp, na.rm = TRUE),
+    median_wind = median(wind.sp, na.rm = TRUE),
+    median_pressure = median(atm.press, na.rm = TRUE),
+    .groups = 'drop'  # Prevents group attributes from being retained
+  )
+
+# Step 2: Merge the medians back to the metmerge data
+met_with_medians <- metmerge %>%
+  left_join(state_medians, by = "STATE")
+
+# Step 3: Calculate the Euclidean distance
+met_with_medians <- met_with_medians %>%
+  mutate(
+    euclidean_distance = sqrt((temp - median_temp)^2 +
+                              (wind.sp - median_wind)^2 +
+                              (atm.press - median_pressure)^2)
+  )
+
+# Step 4: Find the closest station per state
+repByState <- met_with_medians %>%
+  group_by(STATE) %>%
+  slice_min(euclidean_distance, with_ties = TRUE) %>%  # Select the station with the smallest distance
+  arrange(lat) %>%  # Sort by latitude
+  slice(1) %>%  # Select the station with the lowest latitude in case of ties
+  select(STATE, USAFID, lat, lon, temp, wind.sp, atm.press, euclidean_distance)
+
+# Convert to data frame (if not already)
+repByState <- as.data.frame(repByState)
+
+# Print the results
+print(repByState)
+```
+
+## Question 3: In the middle?
+
+```{r}
+library(dplyr)
+library(leaflet)
+state_midpoints <- metmerge %>%
+  group_by(STATE) %>%
+  summarise(
+    mid_lat = mean(lat, na.rm = TRUE),
+    mid_lon = mean(lon, na.rm = TRUE),
+    .groups = 'drop'
+  )
+closest_stations <- metmerge %>%
+  left_join(state_midpoints, by = "STATE") %>%
+  mutate(
+    distance_to_midpoint = sqrt((lat - mid_lat)^2 + (lon - mid_lon)^2)
+  ) %>%
+  group_by(STATE) %>%
+  slice_min(distance_to_midpoint, with_ties = FALSE) %>%
+  select(STATE, USAFID, lat, lon, temp, wind.sp, atm.press)
+combined_stations <- bind_rows(repByState, closest_stations)
+combined_stations <- combined_stations %>%
+  mutate(
+    group = case_when(
+      USAFID %in% repByState$USAFID ~ "Representative Station",
+      USAFID %in% closest_stations$USAFID ~ "Closest to Midpoint"
+    )
+  )
+leaflet(combined_stations) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    lng = ~lon, lat = ~lat,
+    color = ~ifelse(group == "Representative Station", "blue", "red"),
+    radius = 5,
+    label = ~paste("State:", STATE, "<br>",
+                   "USAFID:", USAFID, "<br>",
+                   "Temp:", temp, "<br>",
+                   "Wind Speed:", wind.sp, "<br>",
+                   "Pressure:", atm.press),
+    group = ~group
+  ) %>%
+  addLegend("bottomright", colors = c("blue", "red"), 
+            labels = c("Representative Station", "Closest to Midpoint"),
+            title = "Station Type") %>%
+  setView(lng = -98.5833, lat = 39.8333, zoom = 4)
+
+
+```
+
+## Question 4: Means of means
+
+```{r}
+avg_temp_by_state <- metmerge %>%
+  group_by(STATE) %>%
+  summarise(
+    avg_temp = mean(temp, na.rm = TRUE),
+    num_entries = n(),  
+    num_na_entries = sum(is.na(temp)),  
+    num_stations = n_distinct(USAFID),  
+    .groups = 'drop'
+  )
+avg_temp_by_state <- avg_temp_by_state %>%
+  mutate(
+    temp_level = case_when(
+      avg_temp < 20 ~ "Low",
+      avg_temp >= 20 & avg_temp < 25 ~ "Mid",
+      avg_temp >= 25 ~ "High"
+    )
+  )
+summary_table <- avg_temp_by_state %>%
+  group_by(temp_level) %>%
+  summarise(
+    num_states = n(),
+    total_entries = sum(num_entries),  
+    total_na_entries = sum(num_na_entries),  
+    total_stations = sum(num_stations),  
+    mean_temp = mean(avg_temp, na.rm = TRUE), 
+    mean_wind_speed = mean(metmerge$wind.sp[metmerge$STATE %in% avg_temp_by_state$STATE[avg_temp_by_state$temp_level == temp_level]], na.rm = TRUE),  
+    mean_atm_pressure = mean(metmerge$atm.press[metmerge$STATE %in% avg_temp_by_state$STATE[avg_temp_by_state$temp_level == temp_level]], na.rm = TRUE),  
+    .groups = 'drop'
+  )
+print(summary_table)
+
+```
